@@ -1,1 +1,6 @@
-export { useColorScheme } from 'react-native';
+/**
+ * App is light-theme only.
+ */
+export function useColorScheme() {
+  return "light" as const;
+}

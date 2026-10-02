@@ -1,0 +1,119 @@
+import axios, { AxiosError, type InternalAxiosRequestConfig } from "axios";
+import { router } from "expo-router";
+
+import { forceSignOut } from "@/api/authSession";
+import { refreshAccessToken } from "@/api/refreshAccessToken";
+import { ENV } from "@/constants/env";
+import { getAccessToken } from "@/storage/tokenStorage";
+
+export const api = axios.create({
+  baseURL: ENV.supabaseUrl,
+  // Expo DevTools Network tab instruments `fetch`, not XHR (axios default).
+  adapter: "fetch",
+  headers: {
+    "Content-Type": "application/json",
+    Accept: "application/json",
+    ...(ENV.supabaseAnonKey ? { apikey: ENV.supabaseAnonKey } : {}),
+  },
+});
+
+type RetryConfig = InternalAxiosRequestConfig & {
+  _retry?: boolean;
+};
+
+const SKIP_REFRESH_URLS = [
+  "/auth/v1/token",
+  "/auth/v1/recover",
+  "/auth/v1/verify",
+  "/auth/v1/logout",
+  "/functions/v1/verify-otp",
+];
+
+const shouldSkipRefresh = (url?: string) => {
+  if (!url) return false;
+  return SKIP_REFRESH_URLS.some((path) => url.includes(path));
+};
+
+let isRefreshing = false;
+let failedQueue: Array<{
+  resolve: (token: string) => void;
+  reject: (error: unknown) => void;
+}> = [];
+
+const processQueue = (error: unknown, token: string | null = null) => {
+  failedQueue.forEach((promise) => {
+    if (error) {
+      promise.reject(error);
+    } else if (token) {
+      promise.resolve(token);
+    }
+  });
+  failedQueue = [];
+};
+
+api.interceptors.request.use(
+  async (config) => {
+    if (ENV.supabaseAnonKey) {
+      config.headers.apikey = ENV.supabaseAnonKey;
+    }
+
+    const token = await getAccessToken();
+    if (token) {
+      config.headers.Authorization = `Bearer ${token}`;
+    }
+
+    if (__DEV__) {
+      const method = (config.method ?? "get").toUpperCase();
+      const url = `${config.baseURL ?? ""}${config.url ?? ""}`;
+      console.log(`[api] ${method} ${url}`);
+    }
+
+    return config;
+  },
+  (error) => Promise.reject(error),
+);
+
+api.interceptors.response.use(
+  (response) => response,
+  async (error: AxiosError) => {
+    const originalRequest = error.config as RetryConfig | undefined;
+
+    if (
+      !originalRequest ||
+      error.response?.status !== 401 ||
+      originalRequest._retry ||
+      shouldSkipRefresh(originalRequest.url)
+    ) {
+      return Promise.reject(error);
+    }
+
+    if (isRefreshing) {
+      return new Promise((resolve, reject) => {
+        failedQueue.push({
+          resolve: (token: string) => {
+            originalRequest.headers.Authorization = `Bearer ${token}`;
+            resolve(api(originalRequest));
+          },
+          reject,
+        });
+      });
+    }
+
+    originalRequest._retry = true;
+    isRefreshing = true;
+
+    try {
+      const newAccessToken = await refreshAccessToken();
+      processQueue(null, newAccessToken);
+      originalRequest.headers.Authorization = `Bearer ${newAccessToken}`;
+      return api(originalRequest);
+    } catch (refreshError) {
+      processQueue(refreshError, null);
+      await forceSignOut();
+      router.replace("/(auth)/login");
+      return Promise.reject(refreshError);
+    } finally {
+      isRefreshing = false;
+    }
+  },
+);
